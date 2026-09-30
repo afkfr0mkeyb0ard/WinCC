@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+IMAGE="${WINCC_IMAGE:-wincc:latest}"
+
+ARCH="x64"
+MODE="auto"
+BUILD="release"
+
+ARGS=()
+SOURCES=()
+OUTPUT=""
+
+usage() {
+    cat <<USAGE
+Usage:
+  wincc [options] source.c -o program.exe
+  wincc [options] source.cpp -o plugin.dll
+
+Options:
+  --arch x64       Compile for Windows 64-bit (default)
+  --arch x86       Compile for Windows 32-bit
+
+  --dll            Build a DLL
+  --exe            Build an executable
+  --auto           Automatically detect DLL/EXE (default)
+
+  --debug          Debug build
+  --release        Release build (default)
+
+  --static         Static linking
+
+  -h, --help       Show this help
+
+Examples:
+  wincc hello.c -o hello.exe
+  wincc hello.cpp -std=c++20 -o hello.exe
+  wincc plugin.c -o plugin.dll
+  wincc plugin.cpp -std=c++20 -o plugin.dll
+  wincc --arch x86 hello.c -o hello.exe
+  wincc --debug main.cpp -o app.exe
+  wincc --static main.cpp -O2 -o app.exe
+
+Automatic detection:
+  DllMain(...)          -> DLL
+  main(...)             -> EXE
+  WinMain(...)          -> EXE
+  wWinMain(...)         -> EXE
+
+Explicit --dll / --exe always takes precedence.
+USAGE
+}
+
+die() {
+    echo "wincc: $*" >&2
+    exit 2
+}
+
+warn() {
+    echo "wincc: warning: $*" >&2
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --arch)
+            [[ $# -ge 2 ]] || die "--arch requires x86 or x64"
+            ARCH="$2"
+            shift 2
+            ;;
+
+        --arch=*)
+            ARCH="${1#*=}"
+            shift
+            ;;
+
+        --dll)
+            MODE="dll"
+            shift
+            ;;
+
+        --exe)
+            MODE="exe"
+            shift
+            ;;
+
+        --auto)
+            MODE="auto"
+            shift
+            ;;
+
+        --debug)
+            BUILD="debug"
+            shift
+            ;;
+
+        --release)
+            BUILD="release"
+            shift
+            ;;
+
+        --static)
+            ARGS+=("-static")
+            shift
+            ;;
+
+        -o)
+            [[ $# -ge 2 ]] || die "-o requires an output file"
+            OUTPUT="$2"
+            ARGS+=("$1" "$2")
+            shift 2
+            ;;
+
+        -o*)
+            OUTPUT="${1#-o}"
+            ARGS+=("$1")
+            shift
+            ;;
+
+        -h|--help)
+            usage
+            exit 0
+            ;;
+
+        --)
+            shift
+            ARGS+=("$@")
+            break
+            ;;
+
+        *.c|*.cc|*.cpp|*.cxx|*.C)
+            SOURCES+=("$1")
+            ARGS+=("$1")
+            shift
+            ;;
+
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+[[ ${#SOURCES[@]} -gt 0 ]] || die "no C/C++ source file specified"
+
+# ---------------------------------------------------------------------------
+# Architecture
+# ---------------------------------------------------------------------------
+
+case "$ARCH" in
+    x64)
+        PREFIX="x86_64-w64-mingw32"
+        ;;
+
+    x86)
+        PREFIX="i686-w64-mingw32"
+        ;;
+
+    *)
+        die "unknown architecture '$ARCH' (available: x86, x64)"
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Detect C vs C++
+# ---------------------------------------------------------------------------
+
+COMPILER="${PREFIX}-gcc"
+
+for source in "${SOURCES[@]}"; do
+    case "$source" in
+        *.cpp|*.cc|*.cxx|*.C)
+            COMPILER="${PREFIX}-g++"
+            break
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Detect DLL / EXE from source contents
+# ---------------------------------------------------------------------------
+
+FOUND_DLL=0
+FOUND_EXE=0
+
+for source in "${SOURCES[@]}"; do
+    [[ -f "$source" ]] || die "source file not found: $source"
+
+    # DLL entry point.
+    if grep -Eq '\bDllMain[[:space:]]*\(' "$source"; then
+        FOUND_DLL=1
+    fi
+
+    # Standard C/C++ executable entry point.
+    if grep -Eq '\bmain[[:space:]]*\(' "$source"; then
+        FOUND_EXE=1
+    fi
+
+    # Windows GUI executable entry points.
+    if grep -Eq '\bWinMain[[:space:]]*\(' "$source"; then
+        FOUND_EXE=1
+    fi
+
+    if grep -Eq '\bwWinMain[[:space:]]*\(' "$source"; then
+        FOUND_EXE=1
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# Determine detected mode
+# ---------------------------------------------------------------------------
+
+DETECTED_MODE=""
+
+if [[ "$FOUND_DLL" == 1 && "$FOUND_EXE" == 1 ]]; then
+    die "sources contain both DLL and EXE entry points; use --dll or --exe"
+
+elif [[ "$FOUND_DLL" == 1 ]]; then
+    DETECTED_MODE="dll"
+
+elif [[ "$FOUND_EXE" == 1 ]]; then
+    DETECTED_MODE="exe"
+fi
+
+# ---------------------------------------------------------------------------
+# Resolve mode
+#
+# Explicit --dll / --exe wins.
+# Otherwise source content wins.
+# Output extension is only used as a fallback/check.
+# ---------------------------------------------------------------------------
+
+if [[ "$MODE" == "auto" ]]; then
+
+    if [[ -n "$DETECTED_MODE" ]]; then
+        MODE="$DETECTED_MODE"
+
+        # Check output extension for inconsistencies.
+        case "${OUTPUT,,}" in
+            *.dll)
+                if [[ "$MODE" == "exe" ]]; then
+                    warn "source looks like an EXE but output is '$OUTPUT'"
+                    warn "using EXE because the source contains an executable entry point"
+                fi
+                ;;
+
+            *.exe)
+                if [[ "$MODE" == "dll" ]]; then
+                    warn "source looks like a DLL but output is '$OUTPUT'"
+                    warn "using DLL because the source contains DllMain()"
+                fi
+                ;;
+        esac
+
+    else
+        # No recognizable entry point in source.
+        # Fall back to output extension.
+
+        case "${OUTPUT,,}" in
+            *.dll)
+                MODE="dll"
+                ;;
+
+            *.exe)
+                MODE="exe"
+                ;;
+
+            *)
+                die "could not determine whether target is DLL or EXE; use --dll or --exe"
+                ;;
+        esac
+    fi
+
+else
+    # Explicit mode was requested.
+    if [[ -n "$DETECTED_MODE" && "$MODE" != "$DETECTED_MODE" ]]; then
+        warn "explicit --$MODE conflicts with detected source type ($DETECTED_MODE)"
+        warn "using explicit --$MODE"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Build flags
+# ---------------------------------------------------------------------------
+
+if [[ "$BUILD" == "debug" ]]; then
+    ARGS+=("-O0" "-g")
+else
+    ARGS+=("-O2")
+fi
+
+# ---------------------------------------------------------------------------
+# Target flags
+# ---------------------------------------------------------------------------
+
+if [[ "$MODE" == "dll" ]]; then
+    ARGS+=("-shared")
+else
+    ARGS+=("-mconsole")
+fi
+
+# ---------------------------------------------------------------------------
+# Information
+# ---------------------------------------------------------------------------
+
+echo "[wincc] target   : Windows $ARCH"
+echo "[wincc] compiler : $COMPILER"
+echo "[wincc] mode     : $MODE"
+echo "[wincc] build    : $BUILD"
+echo "[wincc] image    : $IMAGE"
+
+# ---------------------------------------------------------------------------
+# Docker
+# ---------------------------------------------------------------------------
+
+exec docker run \
+    --rm \
+    -u "$(id -u):$(id -g)" \
+    -v "$PWD:/src" \
+    -w /src \
+    "$IMAGE" \
+    "$COMPILER" \
+    "${ARGS[@]}"
